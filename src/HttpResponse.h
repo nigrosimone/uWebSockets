@@ -43,6 +43,15 @@ static const char *HTTP_200_OK = "200 OK";
 /* The general timeout for HTTP sockets */
 static const int HTTP_TIMEOUT_S = 10;
 
+/* A response fixed when it was registered, framed once per Date tick and written as one piece */
+struct PreformattedResponse {
+    std::string head; /* status line and headers */
+    std::string tail; /* Content-Length, the blank line and the body */
+    uintmax_t bodyLength = 0;
+    std::string frame;
+    char date[29] = {};
+};
+
 template <bool SSL>
 struct HttpResponse : public AsyncSocket<SSL> {
     /* Solely used for getHttpResponseData() */
@@ -245,6 +254,38 @@ private:
     }
 
 public:
+    /* Ends with a response framed ahead of time, in one write. Returns false and writes nothing when
+     * something was already written or the connection is to close, which the ordinary path handles */
+    bool tryEndPreformatted(PreformattedResponse &preformatted) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+
+        if (httpResponseData->state & (HttpResponseData<SSL>::HTTP_STATUS_CALLED | HttpResponseData<SSL>::HTTP_WRITE_CALLED
+            | HttpResponseData<SSL>::HTTP_END_CALLED | HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE)) {
+            return false;
+        }
+
+        /* The frame carries the Date, so it is rebuilt when the loop's Date ticks */
+        LoopData *loopData = Super::getLoopData();
+        if (preformatted.frame.empty() || memcmp(preformatted.date, loopData->date, 29)) {
+            memcpy(preformatted.date, loopData->date, 29);
+            preformatted.frame.assign(preformatted.head);
+            preformatted.frame.append("Date: ", 6).append(loopData->date, 29).append("\r\n", 2);
+#ifndef UWS_HTTPRESPONSE_NO_WRITEMARK
+            if (!loopData->noMark) {
+                preformatted.frame.append("uWebSockets: 20\r\n", 17);
+            }
+#endif
+            preformatted.frame.append(preformatted.tail);
+        }
+
+        httpResponseData->state |= HttpResponseData<SSL>::HTTP_STATUS_CALLED | HttpResponseData<SSL>::HTTP_END_CALLED;
+        Super::write(preformatted.frame.data(), (int) preformatted.frame.length());
+        httpResponseData->offset = preformatted.bodyLength;
+        Super::timeout(HTTP_TIMEOUT_S);
+        httpResponseData->markDone();
+        return true;
+    }
+
     /* If we have proxy support; returns the proxed source address as reported by the proxy. */
 #ifdef UWS_WITH_PROXY
     std::string_view getProxiedRemoteAddress() {
